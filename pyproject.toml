@@ -1,0 +1,14 @@
+[project]
+name = "toy-pipelined-inference"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12.2"
+dependencies = [
+    "torch>=2.6.0",
+]
+
+[dependency-groups]
+dev = [
+    "lovely-tensors>=0.1.18",
+]

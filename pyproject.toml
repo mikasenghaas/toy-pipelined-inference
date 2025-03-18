@@ -9,3 +9,9 @@ dependencies = [
     "loguru>=0.7.3",
     "torch>=2.6.0",
 ]
+
+[dependency-groups]
+viz = [
+    "matplotlib>=3.10.1",
+    "pandas>=2.2.3",
+]

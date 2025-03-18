@@ -4,45 +4,79 @@ import torch
 import torch.distributed as dist
 import multiprocessing as mp
 from functools import partial
-from subprocess import Popen
+from typing import Optional
 from lovely_tensors import monkey_patch; monkey_patch()
 from loguru import logger as loguru_logger
 
 next_token = 0
 logger = None
-def setup_logger(rank: int):
+def setup_logger(rank: int, log_level: str, start_time: Optional[float] = None):
     loguru_logger.remove()
     colors = ["green", "blue", "yellow", "red"]
     color = colors[rank]
-    start_time = time.time()
+    
+    def my_format(record):
+        if start_time is not None:
+            # Calculate elapsed time from custom start time
+            current_time = record["time"].timestamp()
+            elapsed = current_time - start_time
+        else:
+            # Use loguru's default elapsed time
+            elapsed = record["elapsed"].total_seconds()
+            
+        return f"<level><{color}>Rank {rank} | {{level:<5}} | {{time:mm:ss}} | {elapsed:.1f}s | {{message}}</{color}></level>\n"
+    
     loguru_logger.add(
         sys.stdout,
-        format=f"<level><{color}>Rank {rank} | {{level:<5}} | {{time:mm:ss}} | {{elapsed.seconds:>3.1f}}s | {{message}}</{color}></level>",
+        format=my_format,
         colorize=True,
         enqueue=True,
-        level="INFO",
+        level=log_level,
     )
     global logger
     logger = loguru_logger.bind(rank=rank)
 
-def init_model(rank, world_size):
+def init_model(rank, world_size, forward_time: float = 1.0):
     def run_forward(x, token_idx, micro_batch_idx, rank, world_size):
         global next_token
-        logger.info(f"Running forward for token {token_idx} of micro batch {micro_batch_idx}")
-        time.sleep(1)
+        if logger is not None:
+            logger.debug(f"Run forward ({token_idx}, {micro_batch_idx})")
+        time.sleep(forward_time)
         if rank != world_size - 1:
-            output = torch.full((x.size(0), 1, 4096), x.float().mean(), dtype=torch.long)
+            output = torch.full((x.size(0), 1), x.float().mean(), dtype=torch.long)
         else:
             next_token += 1
             output = torch.full((x.size(0), 1), next_token, dtype=torch.long)
-        logger.info(f"Ran forward for token {token_idx} of micro batch {micro_batch_idx}")
+        if logger is not None:
+            logger.info(f"Ran forward ({token_idx}, {micro_batch_idx})")
         return output
     return partial(run_forward, rank=rank, world_size=world_size)
 
-def pipeline1(model, batched_tokens, rank, world_size, num_new_tokens):
-    """Decodes micro-batches one-by-one ≈ O(num_micro_batches * num_new_tokens * num_devices)"""
+def warmup(model, batched_tokens, rank, world_size):
     tokens_shape = (batched_tokens[0].size(0), 1)
     hidden_states_shape = (batched_tokens[0].size(0), 1, 4096)
+    dtype = batched_tokens[0].dtype # torch.long
+    device = batched_tokens[0].device # cpu
+    if rank == 0: # first stage
+        hidden_states = model(batched_tokens[0], 0, 0)
+        dist.send(hidden_states, dst=rank+1, tag=0)
+        next_tokens = torch.empty(tokens_shape, dtype=dtype, device=device)
+        dist.recv(next_tokens, src=world_size - 1, tag=0)
+    elif rank == world_size - 1: # last stage
+        hidden_states = torch.empty(hidden_states_shape, dtype=dtype, device=device)
+        dist.recv(hidden_states, src=rank - 1, tag=0)
+        next_tokens = model(hidden_states, 0, 0)
+        dist.send(next_tokens, dst=0, tag=0)
+    else:
+        hidden_states = torch.empty(hidden_states_shape, dtype=dtype, device=device)
+        dist.recv(hidden_states, src=rank - 1, tag=0)
+        hidden_states = model(hidden_states, 0, 0)
+        dist.send(hidden_states, dst=rank + 1, tag=0)
+
+def pipeline1(model, batched_tokens, rank, world_size, num_new_tokens, latency: float = 0.0):
+    """Synchronous 1F1B pipeline"""
+    tokens_shape = (batched_tokens[0].size(0), 1)
+    hidden_states_shape = (batched_tokens[0].size(0), 1, 1)
     dtype = batched_tokens[0].dtype # torch.long
     device = batched_tokens[0].device # cpu
 
@@ -50,28 +84,31 @@ def pipeline1(model, batched_tokens, rank, world_size, num_new_tokens):
         for i in range(num_new_tokens): # decoding steps
             for j in range(len(batched_tokens)):
                 hidden_states = model(batched_tokens[j], i, j)
+                time.sleep(latency / 1000)
                 dist.send(hidden_states, dst=1, tag=j)
                 next_tokens = torch.empty(tokens_shape, dtype=dtype, device=device)
-                dist.recv(next_tokens, src=1, tag=j)
-                batched_tokens[j] = torch.cat((batched_tokens[j], next_tokens), dim=1)
+                dist.recv(next_tokens, src=world_size - 1, tag=j)
     elif rank == world_size - 1: # last stage
         for i in range(num_new_tokens): # decoding steps
             for j in range(len(batched_tokens)):
                 hidden_states = torch.empty(hidden_states_shape, dtype=dtype, device=device)
-                dist.recv(hidden_states, src=0, tag=j)
+                dist.recv(hidden_states, src=rank-1, tag=j)
                 next_tokens = model(hidden_states, i, j)
+                time.sleep(latency / 1000)
                 dist.send(next_tokens, dst=0, tag=j)
-                batched_tokens[j] = torch.cat((batched_tokens[j], next_tokens), dim=1)
-    else:
-        raise NotImplementedError
-    
-    return batched_tokens
-
+    else: # intermediate stages
+        for i in range(num_new_tokens): # decoding steps
+            for j in range(len(batched_tokens)):
+                hidden_states = torch.empty(hidden_states_shape, dtype=dtype, device=device)
+                dist.recv(hidden_states, src=rank - 1, tag=j)
+                hidden_states = model(hidden_states, i, j)
+                time.sleep(latency / 1000)
+                dist.send(hidden_states, dst=rank + 1, tag=j)
 
 def pipeline2(model, batched_tokens, rank, world_size, num_new_tokens):
-    """Forwards all micro-batches at once, but waits for all micro-batches to be ready"""
+    """Synchronous AFAB pipeline"""
     tokens_shape = (batched_tokens[0].size(0), 1)
-    hidden_states_shape = (batched_tokens[0].size(0), 1, 4096)
+    hidden_states_shape = (batched_tokens[0].size(0), 1, 1)
     dtype = batched_tokens[0].dtype # torch.long
     device = batched_tokens[0].device # cpu
     
@@ -104,60 +141,9 @@ def pipeline2(model, batched_tokens, rank, world_size, num_new_tokens):
     return batched_tokens
 
 def pipeline3(model, batched_tokens, rank, world_size, num_new_tokens):
-    """Async recv on rank 0, else sync"""
+    """Asynchronous pipeline"""
     tokens_shape = (batched_tokens[0].size(0), 1)
-    hidden_states_shape = (batched_tokens[0].size(0), 1, 4096)
-    dtype = batched_tokens[0].dtype # torch.long
-    device = batched_tokens[0].device # cpu
-    num_micro_batches = len(batched_tokens)
-    
-    if rank == 0: # first stage
-        # Initial forwards for all micro-batches to start the pipeline
-        recv_reqs = [None] * num_micro_batches
-        recv_buffers = [None] * num_micro_batches
-        if num_new_tokens > 0:
-            for j in range(num_micro_batches):
-                hidden_states = model(batched_tokens[j], 0, j)
-                dist.send(hidden_states, dst=1, tag=j)
-
-                recv_buffers[j] = torch.empty(tokens_shape, dtype=dtype, device=device)
-                recv_reqs[j] = dist.irecv(recv_buffers[j], src=1, tag=j)
-        
-        # Process remaining tokens while keeping pipeline full
-        for i in range(num_new_tokens): # decoding steps
-            # Wait for oldest results and update
-            for j in range(num_micro_batches):
-                recv_reqs[j].wait()
-                batched_tokens[j] = torch.cat((batched_tokens[j], recv_buffers[j]), dim=1)
-                
-                # Immediately process and send next token, except on last iteration
-                if i < num_new_tokens - 1:
-                    hidden_states = model(batched_tokens[j], i, j)
-                    dist.send(hidden_states, dst=1, tag=j)
-
-                    recv_buffers[j] = torch.empty(tokens_shape, dtype=dtype, device=device)
-                    recv_reqs[j] = dist.irecv(recv_buffers[j], src=1, tag=j)
-    
-    elif rank == world_size - 1: # last stage
-        # Process tokens while keeping pipeline full
-        for i in range(num_new_tokens): # decoding steps
-            for j in range(num_micro_batches):
-                # Wait for input
-                hidden_states = torch.empty(hidden_states_shape, dtype=dtype, device=device)
-                dist.recv(hidden_states, src=0, tag=j)
-                next_tokens = model(hidden_states, i, j)
-                dist.send(next_tokens, dst=0, tag=j)
-                batched_tokens[j] = torch.cat((batched_tokens[j], next_tokens), dim=1)
-    
-    else:
-        raise NotImplementedError
-    
-    return batched_tokens
-
-def pipeline4(model, batched_tokens, rank, world_size, num_new_tokens):
-    """Fully asynchronous. Only wait on items that are needed."""
-    tokens_shape = (batched_tokens[0].size(0), 1)
-    hidden_states_shape = (batched_tokens[0].size(0), 1, 4096)
+    hidden_states_shape = (batched_tokens[0].size(0), 1, 1)
     dtype = batched_tokens[0].dtype # torch.long
     device = batched_tokens[0].device # cpu
     num_micro_batches = len(batched_tokens)
@@ -172,16 +158,16 @@ def pipeline4(model, batched_tokens, rank, world_size, num_new_tokens):
                 hidden_states = model(batched_tokens[j], 0, j)
                 dist.isend(hidden_states, dst=1, tag=j)
                 recv_buffers[j] = torch.empty(tokens_shape, dtype=dtype, device=device)
-                logger.debug(f"{time.strftime('%X')}] Scheduling recv for micro-batch {j}")
+                logger.debug(f"Scheduling recv for micro-batch {j}")
                 recv_reqs[j] = dist.irecv(recv_buffers[j], src=1, tag=j)
 
         # Process remaining tokens while keeping pipeline full
         for i in range(num_new_tokens): # decoding steps
             # Wait for oldest results and update
             for j in range(num_micro_batches):
-                logger.debug(f"{time.strftime('%X')}] Waiting for micro-batch {j}")
+                logger.debug(f"Waiting for micro-batch {j}")
                 recv_reqs[j].wait()
-                logger.debug(f"{time.strftime('%X')}] Received micro-batch {j}")
+                logger.debug(f"Received micro-batch {j}")
                 batched_tokens[j] = torch.cat((batched_tokens[j], recv_buffers[j]), dim=1)
                 
                 # Immediately process and send next token, except on last iteration
@@ -189,7 +175,7 @@ def pipeline4(model, batched_tokens, rank, world_size, num_new_tokens):
                     hidden_states = model(batched_tokens[j], i, j)
                     dist.isend(hidden_states, dst=1, tag=j)
                     recv_buffers[j] = torch.empty(tokens_shape, dtype=dtype, device=device)
-                    logger.debug(f"{time.strftime('%X')}] Scheduling recv for micro-batch {j}")
+                    logger.debug(f"Scheduling recv for micro-batch {j}")
                     recv_reqs[j] = dist.irecv(recv_buffers[j], src=1, tag=j)
     
     elif rank == world_size - 1: # last stage
@@ -197,16 +183,16 @@ def pipeline4(model, batched_tokens, rank, world_size, num_new_tokens):
         recv_buffers = [None] * num_micro_batches
         for j in range(num_micro_batches):
             recv_buffers[j] = torch.empty(hidden_states_shape, dtype=dtype, device=device)
-            logger.debug(f"{time.strftime('%X')}] Scheduling recv for micro-batch {j}")
+            logger.debug(f"Scheduling recv for micro-batch {j}")
             recv_reqs[j] = dist.irecv(recv_buffers[j], src=0, tag=j)
 
         # Process tokens while keeping pipeline full
         for i in range(num_new_tokens): # decoding steps
             for j in range(num_micro_batches):
                 # Wait for input
-                logger.debug(f"{time.strftime('%X')}] Waiting for micro-batch {j}")
+                logger.debug(f"Waiting for micro-batch {j}")
                 recv_reqs[j].wait()
-                logger.debug(f"{time.strftime('%X')}] Received micro-batch {j}")
+                logger.debug(f"Received micro-batch {j}")
                 next_tokens = model(recv_buffers[j], i, j)
                 dist.isend(next_tokens, dst=0, tag=j)
                 batched_tokens[j] = torch.cat((batched_tokens[j], next_tokens), dim=1)
@@ -218,45 +204,40 @@ def pipeline4(model, batched_tokens, rank, world_size, num_new_tokens):
     
     return batched_tokens
 
-def get_pipeline(pipeline_idx: int):
-    if pipeline_idx == 1:
-        return pipeline1
-    elif pipeline_idx == 2:
-        return pipeline2
-    elif pipeline_idx == 3:
-        return pipeline3
-    elif pipeline_idx == 4:
-        return pipeline4
-    else:
-        raise ValueError(f"Invalid pipeline index: {pipeline_idx}")
+PIPELINES = {
+    "1f1b": pipeline1,
+    "afab": pipeline2,
+    "async": pipeline3,
+}
 
-def main(rank: int, world_size: int, pipeline_name: str):
-    setup_logger(rank)
-    logger.info(f"Running")
-    dist.init_process_group(backend="gloo", init_method="tcp://localhost:12345", rank=rank, world_size=world_size)
+def get_pipeline(pipeline_name: str):
+    assert pipeline_name in PIPELINES, f"Invalid pipeline name: {pipeline_name}"
+    return PIPELINES[pipeline_name]
 
-    # Choose pipeline
-    pipeline = get_pipeline(pipeline_name)
+def main(rank, args):
+    # Initialize process group
+    dist.init_process_group(backend="gloo", init_method="tcp://localhost:12345", rank=rank, world_size=args.world_size)
 
     # Prepare dummy tokens
-    batch_size = 2
-    prompt_tokens = 1
-    tokens = torch.zeros(batch_size, prompt_tokens, dtype=torch.long)
+    batch_size = args.world_size * args.num_micro_batches
+    tokens = torch.zeros(batch_size, args.prompt_tokens, dtype=torch.long)
 
     # Split tokens into micro-batches
-    num_micro_batches = world_size
-    micro_batch_size = batch_size // num_micro_batches
+    micro_batch_size = batch_size // args.num_micro_batches
     micro_batches = list(tokens.split(micro_batch_size, dim=0))
 
     # Initialize model
-    model = init_model(rank, world_size)
+    model = init_model(rank, args.world_size, args.forward_time)
+
+    # Warmup
+    warmup(model, micro_batches, rank, args.world_size)
 
     # Run pipelined decoding
-    num_new_tokens = 1
-    start_time = time.time()
-    batched_tokens = pipeline(model, micro_batches, rank, world_size, num_new_tokens)
-    logger.info(f"Time taken: {time.time() - start_time:.2f} seconds")
-    print(torch.cat(batched_tokens, dim=0))
+    dist.barrier()
+    setup_logger(rank, args.log_level, time.time())
+    logger.info("Running")
+    get_pipeline(args.pipeline)(model, micro_batches, rank, args.world_size, args.num_new_tokens, args.latency)
+    logger.info("Done")
 
     dist.destroy_process_group()
 
@@ -264,23 +245,23 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pipeline", type=int, default=1, help="Pipeline function to use")
-    parser.add_argument("--latency", type=float, default=0, help="Add latency (ms)")
+    parser.add_argument("--pipeline", type=str, default="1f1b", help="Pipeline function to use")
+    parser.add_argument("--prompt-tokens", type=int, default=1, help="Number of prompt tokens")
+    parser.add_argument("--num-new-tokens", type=int, default=3, help="Number of new tokens to generate")
+    parser.add_argument("--num-micro-batches", type=int, default=2, help="Number of micro-batches")
     parser.add_argument("--world-size", type=int, default=2, help="Number of processes to run")
+    parser.add_argument("--log-level", type=str, default="INFO", help="Log level")
+    parser.add_argument("--forward-time", type=float, default=1.0, help="Inference time of the model (s)")
+    parser.add_argument("--latency", type=float, default=0, help="Latency of the network (ms)")
     args = parser.parse_args()
 
-    # Add latency using subprocess
-    if args.latency > 0:
-        Popen(["sudo", "tc", "qdisc", "add", "dev", "lo", "root", "netem", "delay", f"{args.latency}ms"])
+    if args.num_micro_batches is None:
+        args.num_micro_batches = args.world_size
 
-    processes = [mp.Process(target=main, args=(rank, args.world_size, args.pipeline)) for rank in range(args.world_size)]
+    # Start processes
+    processes = [mp.Process(target=main, args=(rank, args)) for rank in range(args.world_size)]
 
     for p in processes:
         p.start()
-
-    # Remove latency using subprocess
-    if args.latency > 0:
-        Popen(["sudo", "tc", "qdisc", "del", "dev", "lo", "root", "netem"])
-
     for p in processes:
         p.join()

@@ -3,6 +3,7 @@ import sys
 import torch
 import torch.distributed as dist
 import multiprocessing as mp
+import threading
 from functools import partial
 from typing import Optional
 from lovely_tensors import monkey_patch; monkey_patch()
@@ -105,7 +106,7 @@ def pipeline1(model, batched_tokens, rank, world_size, num_new_tokens, latency: 
                 time.sleep(latency / 1000)
                 dist.send(hidden_states, dst=rank + 1, tag=j)
 
-def pipeline2(model, batched_tokens, rank, world_size, num_new_tokens):
+def pipeline2(model, batched_tokens, rank, world_size, num_new_tokens, latency: float = 0.0):
     """Synchronous AFAB pipeline"""
     tokens_shape = (batched_tokens[0].size(0), 1)
     hidden_states_shape = (batched_tokens[0].size(0), 1, 1)
@@ -116,13 +117,13 @@ def pipeline2(model, batched_tokens, rank, world_size, num_new_tokens):
         for i in range(num_new_tokens): # decoding steps
             for j in range(len(batched_tokens)):
                 hidden_states = model(batched_tokens[j], i, j)
+                time.sleep(latency / 1000)
                 dist.send(hidden_states, dst=1, tag=j)
             
             # Now receive all results
             for j in range(len(batched_tokens)):
                 next_tokens = torch.empty(tokens_shape, dtype=dtype, device=device)
                 dist.recv(next_tokens, src=1, tag=j)
-                batched_tokens[j] = torch.cat((batched_tokens[j], next_tokens), dim=1)
     
     elif rank == world_size - 1: # last stage
         for i in range(num_new_tokens): # decoding steps
@@ -133,14 +134,26 @@ def pipeline2(model, batched_tokens, rank, world_size, num_new_tokens):
                 all_hidden_states.append(hidden_states)
             for j in range(len(batched_tokens)):
                 next_tokens = model(all_hidden_states[j], i, j)
+                time.sleep(latency / 1000)
                 dist.send(next_tokens, dst=0, tag=j)
-                batched_tokens[j] = torch.cat((batched_tokens[j], next_tokens), dim=1)
     else:
-        raise NotImplementedError
-    
-    return batched_tokens
+        for i in range(num_new_tokens): # decoding steps
+            all_hidden_states = []
+            for j in range(len(batched_tokens)):
+                hidden_states = torch.empty(hidden_states_shape, dtype=dtype, device=device)
+                dist.recv(hidden_states, src=0, tag=j)
+                all_hidden_states.append(hidden_states)
+            for j in range(len(batched_tokens)):
+                hidden_states = model(all_hidden_states[j], i, j)
+                time.sleep(latency / 1000)
+                dist.send(hidden_states, dst=1, tag=j)
 
-def pipeline3(model, batched_tokens, rank, world_size, num_new_tokens):
+def delayed_send(tensor, dst, tag, delay_ms):
+    """Helper function to send tensor after specified delay using asyncio"""
+    time.sleep(delay_ms / 1000)
+    return dist.isend(tensor, dst=dst, tag=tag)
+
+def pipeline3(model, batched_tokens, rank, world_size, num_new_tokens, latency: float = 0.0):
     """Asynchronous pipeline"""
     tokens_shape = (batched_tokens[0].size(0), 1)
     hidden_states_shape = (batched_tokens[0].size(0), 1, 1)
@@ -153,56 +166,98 @@ def pipeline3(model, batched_tokens, rank, world_size, num_new_tokens):
         # Initial forwards for all micro-batches to start the pipeline
         recv_reqs = [None] * num_micro_batches
         recv_buffers = [None] * num_micro_batches
+        send_threads = []
         if num_new_tokens > 0:
             for j in range(num_micro_batches):
                 hidden_states = model(batched_tokens[j], 0, j)
-                dist.isend(hidden_states, dst=1, tag=j)
+                thread = threading.Thread(
+                    target=delayed_send,
+                    args=(hidden_states.clone(), 1, j, latency)  # Clone tensor to ensure it persists
+                )
+                thread.start()
+                send_threads.append(thread)
+                # dist.isend(hidden_states, dst=1, tag=j)
                 recv_buffers[j] = torch.empty(tokens_shape, dtype=dtype, device=device)
-                logger.debug(f"Scheduling recv for micro-batch {j}")
-                recv_reqs[j] = dist.irecv(recv_buffers[j], src=1, tag=j)
+                # logger.debug(f"Scheduling recv for micro-batch {j}")
+                recv_reqs[j] = dist.irecv(recv_buffers[j], src=world_size - 1, tag=j)
 
         # Process remaining tokens while keeping pipeline full
         for i in range(num_new_tokens): # decoding steps
             # Wait for oldest results and update
             for j in range(num_micro_batches):
-                logger.debug(f"Waiting for micro-batch {j}")
+                # logger.debug(f"Waiting for micro-batch {j}")
                 recv_reqs[j].wait()
-                logger.debug(f"Received micro-batch {j}")
+                # logger.debug(f"Received micro-batch {j}")
                 batched_tokens[j] = torch.cat((batched_tokens[j], recv_buffers[j]), dim=1)
                 
                 # Immediately process and send next token, except on last iteration
                 if i < num_new_tokens - 1:
                     hidden_states = model(batched_tokens[j], i, j)
-                    dist.isend(hidden_states, dst=1, tag=j)
+                    thread = threading.Thread(
+                        target=delayed_send,
+                        args=(hidden_states.clone(), 1, j, latency)  # Clone tensor to ensure it persists
+                    )
+                    thread.start()
+                    send_threads.append(thread)
+                    # dist.isend(hidden_states, dst=1, tag=j)
                     recv_buffers[j] = torch.empty(tokens_shape, dtype=dtype, device=device)
-                    logger.debug(f"Scheduling recv for micro-batch {j}")
-                    recv_reqs[j] = dist.irecv(recv_buffers[j], src=1, tag=j)
+                    # logger.debug(f"Scheduling recv for micro-batch {j}")
+                    recv_reqs[j] = dist.irecv(recv_buffers[j], src=world_size - 1, tag=j)
+
+        for thread in send_threads:
+            thread.join()
     
     elif rank == world_size - 1: # last stage
         recv_reqs = [None] * num_micro_batches
         recv_buffers = [None] * num_micro_batches
+        send_threads = []
         for j in range(num_micro_batches):
             recv_buffers[j] = torch.empty(hidden_states_shape, dtype=dtype, device=device)
-            logger.debug(f"Scheduling recv for micro-batch {j}")
-            recv_reqs[j] = dist.irecv(recv_buffers[j], src=0, tag=j)
+            recv_reqs[j] = dist.irecv(recv_buffers[j], src=rank-1, tag=j)
 
         # Process tokens while keeping pipeline full
         for i in range(num_new_tokens): # decoding steps
             for j in range(num_micro_batches):
                 # Wait for input
-                logger.debug(f"Waiting for micro-batch {j}")
+                # logger.debug(f"Waiting for micro-batch {j}")
                 recv_reqs[j].wait()
-                logger.debug(f"Received micro-batch {j}")
+                # logger.debug(f"Received micro-batch {j}")
                 next_tokens = model(recv_buffers[j], i, j)
-                dist.isend(next_tokens, dst=0, tag=j)
-                batched_tokens[j] = torch.cat((batched_tokens[j], next_tokens), dim=1)
+                thread = threading.Thread(
+                    target=delayed_send,
+                    args=(next_tokens.clone(), 0, j, latency)
+                )
+                thread.start()
+                send_threads.append(thread)
                 recv_buffers[j] = torch.empty(hidden_states_shape, dtype=dtype, device=device)
-                recv_reqs[j] = dist.irecv(recv_buffers[j], src=0, tag=j)
-    
+                recv_reqs[j] = dist.irecv(recv_buffers[j], src=rank-1, tag=j)
+        for thread in send_threads:
+            thread.join()
     else:
-        raise NotImplementedError
+        recv_reqs = [None] * num_micro_batches
+        recv_buffers = [None] * num_micro_batches
+        send_threads = []
+        for j in range(num_micro_batches):
+            recv_buffers[j] = torch.empty(hidden_states_shape, dtype=dtype, device=device)
+            recv_reqs[j] = dist.irecv(recv_buffers[j], src=rank-1, tag=j)
+
+        for i in range(num_new_tokens): # decoding steps
+            for j in range(num_micro_batches):
+                recv_reqs[j].wait()
+                hidden_states = model(recv_buffers[j], i, j)
+                thread = threading.Thread(
+                    target=delayed_send,
+                    args=(hidden_states.clone(), rank+1, j, latency)
+                )
+                thread.start()
+                send_threads.append(thread)
+                recv_buffers[j] = torch.empty(hidden_states_shape, dtype=dtype, device=device)
+                recv_reqs[j] = dist.irecv(recv_buffers[j], src=rank-1, tag=j)
+        for thread in send_threads:
+            thread.join()
     
-    return batched_tokens
+    dist.barrier()
+            
 
 PIPELINES = {
     "1f1b": pipeline1,
